@@ -10,7 +10,7 @@
   \___\__,_|_| |_|\__,_|_|  |_|   //   ||
 ```
 
-給与一覧やパスワード一覧に見せかけたおとりファイルを作り、開かれたらメールで知らせる炭鉱のカナリア。ファイルには透明な 1px の画像（とリンク）が外部参照で埋め込まれていて、取りに来たアクセスを AWS Lambda が受けて通知する。
+炭鉱のカナリアは死して鳴く。
 
 ## 必要なもの
 
@@ -25,39 +25,18 @@
 git clone git@github.com:kamataryo/tf-canary-securite.git
 cd tf-canary-securite
 aws login
-```
-
-### デプロイ
-
-リソースは aws CLI に設定されたリージョンに作られる。
-
-```sh
 terraform init
-env $(aws configure export-credentials --format env-no-export) terraform apply
+terraform apply
 ```
-
-同時実行数の上限が 10 のままのアカウントでは apply が失敗するので、`-var reserved_concurrency=-1` を付ける。
 
 ### パスを通す
 
 ```sh
 mkdir -p ~/.local/bin
 ln -s "$PWD/canari" ~/.local/bin/canari
-```
-
-`~/.local/bin` がパスに入っていなければ `~/.zshrc` に足す。
-
-```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-```
-
-### 補完
-
-`~/.zshrc` の `compinit` より後に読み込まれるように足す（oh-my-zsh などを使っていれば末尾でよい）。
-
-```sh
+# 補完
 echo 'source <(canari completion)' >> ~/.zshrc
-exec zsh
 ```
 
 ### 通知先
