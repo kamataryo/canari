@@ -4,3 +4,4 @@
 *.tfvars
 .build/
 __pycache__/
+.envrc

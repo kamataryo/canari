@@ -57,11 +57,12 @@ def hit(token, path, http, headers):
         return datetime.fromtimestamp(int(item[key]["N"]), JST).strftime("%Y-%m-%d %H:%M:%S")
 
     name = item["filename"]["S"]
+    label = (item.get("label") or item.get("description") or {"S": "-"})["S"]  # 旧データは description に入っている
     sns.publish(
         TopicArn=os.environ["TOPIC"],
-        Subject=f"canari: {name}"[:99],
+        Subject=f"canari: [{label}] {name}"[:99],
         Message="\n".join([
-            f"メモ: {item['description']['S']}",
+            f"ラベル: {label}",
             f"ファイル: {name}",
             f"日時: {jst('last_hit_at')}",
             f"IP: {http['sourceIp']}",

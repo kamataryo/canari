@@ -9,7 +9,9 @@ import shlex
 import string
 import subprocess
 import sys
+import termios
 import time
+import tty
 import unicodedata
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -33,21 +35,23 @@ USAGE = r"""
     \___\__,_|_| |_|\__,_|_|  |_|   //   ||
 
 usage: canari <command>
-  new            おとりファイルを作る
-  list           置いたものの一覧
-  revoke         失効させる
-  notify add     通知先のメールを足す
-  notify remove  通知先のメールを外す
-  stack          スタックの状態
-  completion     zsh 補完（~/.zshrc に source <(canari completion)）"""
+  new              おとりファイルを作る
+  list [ラベル]    ラベルごとの一覧。ラベル（部分一致）を付けるとファイルごと
+  revoke [ラベル]  失効させる（通知を止め、記録は残す）。ラベル（部分一致）で絞り込める
+  remove [ラベル]  台帳から消す。ラベル（部分一致）で絞り込める
+  notify list      通知先の一覧
+  notify add       通知先のメールを足す
+  notify remove    通知先のメールを外す
+  stack            スタックの状態
+  completion       zsh 補完（~/.zshrc に source <(canari completion)）"""
 
 NO_STACK = f"""スタックがありません。作るには:
   pushd {shlex.quote(str(HERE))} && terraform init && env $(aws configure export-credentials --format env-no-export) terraform apply ; popd"""
 
 ZSH = """_canari() {
   case $CURRENT in
-    2) compadd new list revoke notify stack completion ;;
-    3) [[ $words[2] == notify ]] && compadd add remove ;;
+    2) compadd new list revoke remove notify stack completion ;;
+    3) [[ $words[2] == notify ]] && compadd list add remove ;;
   esac
 }
 compdef _canari canari"""
@@ -66,10 +70,13 @@ def topic_arn():
     return aws("lambda", "get-function-configuration", "--function-name", FUNCTION)["Environment"]["Variables"]["TOPIC"]
 
 
-def items():
+def items(word=""):
+    """作成順。word を渡すとラベルに部分一致（大文字小文字は無視）するものだけ"""
     rows = [{k: int(v["N"]) if "N" in v else v["S"] for k, v in it.items()}
-            for it in aws("dynamodb", "scan", "--table-name", TABLE)["Items"]]
-    return sorted(rows, key=lambda r: r["created_at"])  # ponytail: 全件 Scan。数千件までは困らない
+            for it in aws("dynamodb", "scan", "--table-name", TABLE)["Items"]]  # ponytail: 全件 Scan。数千件までは困らない
+    for r in rows:
+        r.setdefault("label", r.pop("description", ""))  # 旧データは description に入っている
+    return sorted((r for r in rows if word.casefold() in r["label"].casefold()), key=lambda r: r["created_at"])
 
 
 def beacon_base():
@@ -91,17 +98,57 @@ def table(rows):
     return ["  ".join(c + " " * (w - width(c)) for c, w in zip(r, widths)).rstrip() for r in rows]
 
 
-def pick(labels):
-    digits = len(str(len(labels)))
-    for i, label in enumerate(labels, 1):
-        print(f"  {i:>{digits}}) {label}")
-    while True:
-        try:
-            nums = {int(s) for s in input("> ").split()}
-        except ValueError:
-            continue
-        if nums and nums <= set(range(1, len(labels) + 1)):
-            return sorted(n - 1 for n in nums)
+def pick(labels, multi=True):
+    """↑↓（j/k）で移動、space で選択、enter で決定。何も選ばずに enter なら今の行だけ。
+    先頭の all は全部選ぶ・全部外すの切り替え。カーソルは誤って全部を選ばないよう 1 件目から始める。
+    multi=False なら 1 つだけ選ぶ（all も印もなし、enter で今の行）。
+    ponytail: 画面の高さや幅を超える一覧は再描画が崩れる。件数が増えたらスクロールを足す"""
+    fd = sys.stdin.fileno()
+    rows = ["all", *labels] if multi else list(labels)
+    off = 1 if multi else 0  # 行 i が labels[i - off]
+    everything = set(range(len(labels)))
+    cur, chosen = off, set()
+
+    def draw(final=False):
+        for i, label in enumerate(rows):
+            arrow = "❯" if i == cur and not (final and multi) else " "
+            if multi:
+                on = chosen == everything if i == 0 else i - 1 in chosen
+                label = f"{'◉' if on else '◯'} {label}"
+            sys.stdout.write(f"\x1b[2K{arrow} {label}\r\n")
+        sys.stdout.flush()
+
+    saved = termios.tcgetattr(fd)
+    sys.stdout.write("\x1b[?25l")  # カーソルを隠す
+    try:
+        tty.setraw(fd)
+        draw()
+        while True:
+            key = os.read(fd, 1)
+            if key == b"\x1b":
+                key += os.read(fd, 2)
+            if key in (b"\x1b[A", b"k"):
+                cur = (cur - 1) % len(rows)
+            elif key in (b"\x1b[B", b"j"):
+                cur = (cur + 1) % len(rows)
+            elif key == b" " and multi and cur == 0:
+                chosen = set() if chosen == everything else set(everything)
+            elif key == b" " and multi:
+                chosen ^= {cur - 1}
+            elif key in (b"\r", b"\n"):
+                chosen = chosen or (set(everything) if cur == 0 else {cur - 1}) if multi else {cur}
+                break
+            elif key in (b"\x03", b"\x04"):  # raw モードでは Ctrl-C がシグナルにならない
+                raise KeyboardInterrupt
+            sys.stdout.write(f"\x1b[{len(rows)}A")
+            draw()
+        sys.stdout.write(f"\x1b[{len(rows)}A")
+        draw(final=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+    return sorted(chosen)
 
 
 def jst(ts, fmt):
@@ -443,14 +490,12 @@ def render(spec, beacon, created, modified):
 def cmd_new():
     base = beacon_base()
     tpls = templates(date.today())
-    print("埋め込むファイル（番号をスペース区切り）")
+    print("埋め込むファイル（space で選択、enter で決定）")
     chosen = [tpls[i] for i in pick([name for _, name, _ in tpls])]
     exists = [name for _, name, _ in chosen if Path(name).exists()]
     if exists:
         sys.exit(f"既にあります: {' '.join(exists)}")
-    memo = ""
-    while not memo:
-        memo = input("メモ: ").strip()
+    label = ask_label()
     for key, name, spec in chosen:
         token = secrets.token_urlsafe(16)
         created, modified = fake_times()
@@ -458,7 +503,7 @@ def cmd_new():
         # 台帳への登録が先。逆だと、登録に失敗したとき鳴らないファイルが残る
         aws("dynamodb", "put-item", "--table-name", TABLE, "--condition-expression", "attribute_not_exists(id)",
             "--item", json.dumps({
-                "id": {"S": token}, "template": {"S": key}, "filename": {"S": name}, "description": {"S": memo},
+                "id": {"S": token}, "template": {"S": key}, "filename": {"S": name}, "label": {"S": label},
                 "created_at": {"N": str(int(time.time()))}, "hit_count": {"N": "0"},
             }))
         Path(name).write_bytes(data)
@@ -466,31 +511,89 @@ def cmd_new():
         print(f"✓ {name}")
 
 
-def cmd_list():
-    rows = [["状態", "作成日", "ファイル", "メモ", "検知", "最終検知"]]
-    for it in items():
-        rows.append([
-            "失効" if "revoked_at" in it else "有効",
-            jst(it["created_at"], "%Y-%m-%d"),
-            it["filename"],
-            it["description"],
-            str(it.get("hit_count", 0)),
-            jst(it["last_hit_at"], "%Y-%m-%d %H:%M") if "last_hit_at" in it else "-",
-        ])
+def ask_label():
+    """既存のラベルから選ぶか、新しく入力する。表記ゆれでラベルが分かれないように"""
+    known = list(dict.fromkeys(it["label"] for it in reversed(items())))  # 最近使った順
+    if known:
+        print("ラベル（enter で決定）")
+        i = pick(["（新しく入力）", *known], multi=False)[0]
+        if i:
+            return known[i - 1]
+    label = ""
+    while not label:
+        label = " ".join(input("ラベル: ").split())
+    # 大文字小文字だけ違う既存のラベルがあれば、そちらに寄せる
+    return next((k for k in known if k.casefold() == label.casefold()), label)
+
+
+def last_hit(its):
+    ts = [it["last_hit_at"] for it in its if "last_hit_at" in it]
+    return jst(max(ts), "%Y-%m-%d %H:%M") if ts else "-"
+
+
+def cmd_list(word=""):
+    its = items(word)
+    if not its:
+        sys.exit(f"「{word}」を含むラベルはありません" if word else "まだありません（canari new）")
+    if word:  # ファイルごと
+        rows = [["ラベル", "状態", "ファイル", "検知", "最終検知", "作成日"]]
+        for it in sorted(its, key=lambda r: r["label"]):  # 安定ソートなので、ラベルの中は作成順のまま
+            rows.append([it["label"], "失効" if "revoked_at" in it else "有効", it["filename"],
+                         str(it.get("hit_count", 0)), last_hit([it]), jst(it["created_at"], "%Y-%m-%d")])
+    else:  # ラベルごと。最初に作った順
+        groups = {}
+        for it in its:
+            groups.setdefault(it["label"], []).append(it)
+        rows = [["ラベル", "有効", "検知", "最終検知", "作成日"]]
+        for label, g in groups.items():
+            active = sum("revoked_at" not in it for it in g)
+            rows.append([label, f"{active}/{len(g)}", str(sum(it.get("hit_count", 0) for it in g)),
+                         last_hit(g), jst(g[0]["created_at"], "%Y-%m-%d")])
     print("\n".join(table(rows)))
 
 
-def cmd_revoke():
-    active = [it for it in items() if "revoked_at" not in it]
+def cmd_revoke(word=""):
+    active = sorted((it for it in items(word) if "revoked_at" not in it), key=lambda r: r["label"])
     if not active:
         sys.exit("有効なものはありません")
-    print("失効させるもの（番号をスペース区切り）")
-    chosen = pick(table([[jst(it["created_at"], "%Y-%m-%d"), it["filename"], it["description"]] for it in active]))
+    print("失効させるもの（space で選択、enter で決定）")
+    chosen = pick(table([[it["label"], it["filename"], jst(it["created_at"], "%Y-%m-%d")] for it in active]))
     for i in chosen:
         aws("dynamodb", "update-item", "--table-name", TABLE, "--key", json.dumps({"id": {"S": active[i]["id"]}}),
             "--update-expression", "SET revoked_at = :t",
             "--expression-attribute-values", json.dumps({":t": {"N": str(int(time.time()))}}))
     print(f"✓ {len(chosen)} 件")
+
+
+def cmd_remove(word=""):
+    its = sorted(items(word), key=lambda r: r["label"])
+    if not its:
+        sys.exit(f"「{word}」を含むラベルはありません" if word else "まだありません（canari new）")
+    print("台帳から消すもの（space で選択、enter で決定）")
+    chosen = [its[i] for i in pick(table([[it["label"], "失効" if "revoked_at" in it else "有効", it["filename"],
+                                           jst(it["created_at"], "%Y-%m-%d")] for it in its]))]
+    active = sum("revoked_at" not in it for it in chosen)
+    warn = f"。うち有効な {active} 件は、置いたファイルが開かれても分からなくなります" if active else ""
+    if input(f"{len(chosen)} 件を台帳から消します。元に戻せません{warn} [y/N]: ").strip().lower() != "y":
+        sys.exit("やめました")
+    for it in chosen:
+        aws("dynamodb", "delete-item", "--table-name", TABLE, "--key", json.dumps({"id": {"S": it["id"]}}))
+    print(f"✓ {len(chosen)} 件")
+
+
+def cmd_notify_list():
+    rows = [["通知先", "状態"]]
+    for s in subscriptions():
+        arn = s["SubscriptionArn"]
+        if not arn.startswith("arn:"):
+            state = "未確認"
+        else:
+            attrs = aws("sns", "get-subscription-attributes", "--subscription-arn", arn)["Attributes"]
+            state = "確認済み・解除保護" if attrs.get("ConfirmationWasAuthenticated") == "true" else "確認済み"
+        rows.append([s["Endpoint"], state])
+    if len(rows) == 1:
+        sys.exit("なし（canari notify add）")
+    print("\n".join(table(rows)))
 
 
 def cmd_notify_add():
@@ -514,7 +617,7 @@ def cmd_notify_remove():
     subs = [s for s in subscriptions() if s["SubscriptionArn"].startswith("arn:")]  # 未確認のものは解除できない（3 日で消える）
     if not subs:
         sys.exit("外せるものはありません")
-    print("外すもの（番号をスペース区切り）")
+    print("外すもの（space で選択、enter で決定）")
     chosen = pick([s["Endpoint"] for s in subs])
     for i in chosen:
         aws("sns", "unsubscribe", "--subscription-arn", subs[i]["SubscriptionArn"])
@@ -537,6 +640,8 @@ COMMANDS = {
     "new": cmd_new,
     "list": cmd_list,
     "revoke": cmd_revoke,
+    "remove": cmd_remove,
+    "notify list": cmd_notify_list,
     "notify add": cmd_notify_add,
     "notify remove": cmd_notify_remove,
     "stack": cmd_stack,
@@ -545,11 +650,14 @@ COMMANDS = {
 
 
 def main():
-    cmd = COMMANDS.get(" ".join(sys.argv[1:]))
-    if not cmd:
+    args = sys.argv[1:]
+    name = " ".join(args[:2]) if " ".join(args[:2]) in COMMANDS else " ".join(args[:1])
+    word = " ".join(args[len(name.split()):])  # list、revoke、remove だけがラベルの絞り込みを受け取る
+    takes_word = name in ("list", "revoke", "remove")
+    if name not in COMMANDS or (word and not takes_word):
         sys.exit(USAGE)
     try:
-        cmd()
+        COMMANDS[name](word) if takes_word else COMMANDS[name]()
     except (KeyboardInterrupt, EOFError):
         print()
         sys.exit(130)

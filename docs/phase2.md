@@ -25,7 +25,7 @@ canari new ──> IAM ユーザー作成（権限なし + 全拒否）──> �
 1. IAM ユーザーを作る。名前は普通のもの（`ci-deploy`、`backup-s3`、`svc-reporting`、`github-actions` など）。`canari` を名乗らない（`GetCallerIdentity` で攻撃者に ARN が見える）。衝突したら番号を付ける
 2. 全拒否のインラインポリシーを付ける（`Deny * on *`）。後から誤ってグループに入れても何もできないように
 3. アクセスキーを発行する
-4. 台帳に登録する。`id` はアクセスキー ID（`AKIA...`）、ほかの項目はビーコンと同じ（`template`、`filename`、`description`、`created_at`、`hit_count`）に `iam_user` を足す
+4. 台帳に登録する。`id` はアクセスキー ID（`AKIA...`）、ほかの項目はビーコンと同じ（`template`、`filename`、`label`、`created_at`、`hit_count`）に `iam_user` を足す
 5. ファイルを書き出す。シークレットは台帳に残さない
 
 途中で失敗したら、作った IAM ユーザーとキーを消す（鳴らないキーを残さない）。
