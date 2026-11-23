@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""canari: ビーコン入りのおとりファイルを作って管理する。AWS は aws CLI（aws login 済み）経由で触る"""
+import io
+import json
+import os
+import random
+import secrets
+import shlex
+import string
+import subprocess
+import sys
+import time
+import unicodedata
+import zipfile
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+from xml.sax.saxutils import escape
+
+TABLE = "canari-tokens"
+FUNCTION = "canari-beacon"
+JST = timezone(timedelta(hours=9))
+HERE = Path(__file__).resolve().parent
+rng = random.SystemRandom()  # 中身の乱数も OS の乱数で。ほかのファイルから推測されないように
+
+USAGE = r"""
+                                         .-.
+                                        ( o >
+                               _        /   \
+     ___ __ _ _ __   __ _ _ __(_)      / /// )
+    / __/ _` | '_ \ / _` | '__| |     / ///  )
+   | (_| (_| | | | | (_| | |  | |    /_____./
+    \___\__,_|_| |_|\__,_|_|  |_|   //   ||
+
+usage: canari <command>
+  new            おとりファイルを作る
+  list           置いたものの一覧
+  revoke         失効させる
+  notify add     通知先のメールを足す
+  notify remove  通知先のメールを外す
+  stack          スタックの状態
+  completion     zsh 補完（~/.zshrc に source <(canari completion)）"""
+
+NO_STACK = f"""スタックがありません。作るには:
+  pushd {shlex.quote(str(HERE))} && terraform init && env $(aws configure export-credentials --format env-no-export) terraform apply ; popd"""
+
+ZSH = """_canari() {
+  case $CURRENT in
+    2) compadd new list revoke notify stack completion ;;
+    3) [[ $words[2] == notify ]] && compadd add remove ;;
+  esac
+}
+compdef _canari canari"""
+
+
+# --- AWS ---
+
+def aws(*args):
+    r = subprocess.run(["aws", *args, "--output", "json"], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(NO_STACK if "ResourceNotFoundException" in r.stderr else r.stderr.strip())
+    return json.loads(r.stdout.strip() or "null")
+
+
+def topic_arn():
+    return aws("lambda", "get-function-configuration", "--function-name", FUNCTION)["Environment"]["Variables"]["TOPIC"]
+
+
+def items():
+    rows = [{k: int(v["N"]) if "N" in v else v["S"] for k, v in it.items()}
+            for it in aws("dynamodb", "scan", "--table-name", TABLE)["Items"]]
+    return sorted(rows, key=lambda r: r["created_at"])  # ponytail: 全件 Scan。数千件までは困らない
+
+
+def beacon_base():
+    return aws("lambda", "get-function-url-config", "--function-name", FUNCTION)["FunctionUrl"]
+
+
+def subscriptions():
+    return aws("sns", "list-subscriptions-by-topic", "--topic-arn", topic_arn())["Subscriptions"]
+
+
+# --- 端末の表示 ---
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in s)
+
+
+def table(rows):
+    widths = [max(width(r[i]) for r in rows) for i in range(len(rows[0]))]
+    return ["  ".join(c + " " * (w - width(c)) for c, w in zip(r, widths)).rstrip() for r in rows]
+
+
+def pick(labels):
+    digits = len(str(len(labels)))
+    for i, label in enumerate(labels, 1):
+        print(f"  {i:>{digits}}) {label}")
+    while True:
+        try:
+            nums = {int(s) for s in input("> ").split()}
+        except ValueError:
+            continue
+        if nums and nums <= set(range(1, len(labels) + 1)):
+            return sorted(n - 1 for n in nums)
+
+
+def jst(ts, fmt):
+    return datetime.fromtimestamp(ts, JST).strftime(fmt)
+
+
+# --- 中身（架空のデータ） ---
+
+SURNAMES = "佐藤 鈴木 高橋 田中 伊藤 渡辺 山本 中村 小林 加藤 吉田 山田 佐々木 松本 井上 木村 林 斎藤 清水 山口".split()
+GIVEN = "健太 翔太 大輔 拓也 直樹 美咲 彩 陽子 恵 由美 誠 剛 裕子 真由美 浩二 亮 千尋 愛 達也 沙織".split()
+DEPTS = "営業部 開発部 総務部 経理部 人事部 広報部 情報システム部".split()
+POSITIONS = [("部長", 520, 680, 80000), ("課長", 420, 540, 50000), ("主任", 320, 420, 20000), ("一般", 230, 330, 0)]
+SERVICES = [
+    ("AWS 本番 (root)", "https://console.aws.amazon.com/"),
+    ("AWS 検証", "https://console.aws.amazon.com/"),
+    ("Google Workspace 管理コンソール", "https://admin.google.com/"),
+    ("Microsoft 365 管理センター", "https://admin.microsoft.com/"),
+    ("freee 会計", "https://accounts.secure.freee.co.jp/"),
+    ("マネーフォワード クラウド給与", "https://biz.moneyforward.com/"),
+    ("Slack 管理者", "https://slack.com/signin"),
+    ("GitHub Organization owner", "https://github.com/login"),
+    ("法人口座 インターネットバンキング", "https://www.smbc.co.jp/"),
+    ("お名前.com (ドメイン)", "https://www.onamae.com/navi/login/"),
+]
+ADMIN_PATHS = ["/admin", "/admin/login", "/console", "/manage", "/login", "/portal"]
+LOGIN_IDS = "admin root soumu01 keiri it-admin sysadmin".split()
+NOTES = ["", "", "", "2段階認証は総務のスマホ", "共用アカウント", "変更したら情シスに連絡"]
+CORES = [("北斗", "ホクト"), ("青葉", "アオバ"), ("ミナト", "ミナト"), ("さくら", "サクラ"), ("ひかり", "ヒカリ"),
+         ("東和", "トウワ"), ("大和", "ヤマト"), ("富士", "フジ"), ("アステル", "アステル"), ("なごみ", "ナゴミ")]
+KINDS = [("商事", "シヨウジ"), ("システム", "システム"), ("工業", "コウギヨウ"), ("デザイン", "デザイン"),
+         ("物流", "ブツリユウ"), ("印刷", "インサツ")]
+BANKS = {
+    "三菱UFJ銀行": ["本店", "渋谷支店", "新宿支店", "池袋支店"],
+    "三井住友銀行": ["本店営業部", "渋谷駅前支店", "神田支店"],
+    "みずほ銀行": ["東京営業部", "新橋支店", "横浜支店"],
+    "りそな銀行": ["東京営業部", "大宮支店"],
+}
+GRADES = {"S": 15000, "A": 10000, "B": 5000, "C": 0, "D": 0}
+COMMENTS = {
+    "good": ["目標を大きく上回る成果。次期マネージャー候補。", "顧客からの評価が高い。", "後輩の指導に積極的。"],
+    "mid": ["期待どおりの成果。", "安定して業務を遂行。", "来期は主体性に期待。"],
+    "bad": ["プロジェクト遅延あり。改善計画を面談で共有済み。", "勤怠に課題。PIP の対象として要観察。", "退職の意向あり（面談時）。慰留中。"],
+}
+
+
+def people(n):
+    names = rng.sample([f"{s} {g}" for s in SURNAMES for g in GIVEN], n)
+    return [(f"E{i}", name) for i, name in zip(sorted(rng.sample(range(1001, 2000), n)), names)]
+
+
+def password():
+    chars = string.ascii_letters + string.digits + "!#$%&@"
+    return "".join(rng.choice(chars) for _ in range(rng.randint(12, 16)))
+
+
+def salary():
+    rows = [["社員番号", "氏名", "部署", "役職", "基本給", "役職手当", "通勤手当", "総支給額"]]
+    for emp in people(rng.randint(15, 25)):
+        title, lo, hi, allowance = rng.choices(POSITIONS, weights=[1, 2, 4, 10])[0]
+        base = rng.randint(lo, hi) * 1000
+        commute = rng.randint(50, 250) * 100
+        rows.append([*emp, rng.choice(DEPTS), title, base, allowance, commute, base + allowance + commute])
+    return rows
+
+
+def passwords():
+    rows = [["サービス", "URL", "ID", "パスワード", "更新日", "備考"]]
+    lan = f"192.168.{rng.choice([0, 1, 10, 11, 100])}"
+    services = SERVICES + [("ルーター管理画面", f"http://{lan}.1/"), ("NAS", f"http://{lan}.{rng.randint(2, 254)}:5000/")]
+    for name, url in rng.sample(services, rng.randint(8, len(services))):
+        updated = date.today() - timedelta(days=rng.randint(30, 700))
+        rows.append([name, url, rng.choice(LOGIN_IDS), password(), updated.strftime("%Y/%m/%d"), rng.choice(NOTES)])
+    return rows
+
+
+def accounts():
+    rows = [["取引先コード", "取引先名", "銀行名", "支店名", "種別", "口座番号", "口座名義"]]
+    pairs = rng.sample([(c, k) for c in CORES for k in KINDS], rng.randint(12, 20))
+    for i, ((core, core_kana), (kind, kind_kana)) in enumerate(pairs, 1):
+        bank = rng.choice(list(BANKS))
+        rows.append([f"S{i:04d}", f"株式会社{core}{kind}", bank, rng.choice(BANKS[bank]),
+                     rng.choice(["普通", "普通", "当座"]), f"{rng.randint(0, 9999999):07d}", f"カ）{core_kana}{kind_kana}"])
+    return rows
+
+
+def evaluation(title):
+    rows = [["社員番号", "氏名", "評価", "昇給", "コメント"]]
+    for emp in people(rng.randint(10, 15)):
+        grade = rng.choices("SABCD", weights=[1, 3, 6, 2, 1])[0]
+        tone = "good" if grade in "SA" else "mid" if grade == "B" else "bad"
+        rows.append([*emp, grade, f"+{GRADES[grade]:,}" if GRADES[grade] else "0", rng.choice(COMMENTS[tone])])
+    return [("title", f"【社外秘】{title}"), f"対象: {len(rows) - 1}名　作成: 人事部", rows, "以上"]
+
+
+def servers():
+    net = rng.choice([f"10.{rng.randint(0, 255)}", f"172.{rng.randint(16, 31)}"])
+    env = rng.choice(["prod", "prd", "honban"])
+    user = rng.choice(["ec2-user", "ubuntu", "admin"])
+
+    def host(name, subnet):
+        return f"{name}{rng.randint(1, 3):02d} ({net}.{subnet}.{rng.randint(4, 250)})"
+
+    return [
+        ("title", "サーバー接続情報（取扱注意）"),
+        ("h", "■ 本番環境"),
+        [["用途", "ホスト", "ユーザー", "パスワード"],
+         ["踏み台", host(rng.choice(["bastion", "fumidai", "jump"]), 0), user, password()],
+         ["Web", host(f"{env}-web", rng.randint(1, 9)), user, password()],
+         ["DB", host(f"{env}-db", rng.randint(10, 19)), rng.choice(["admin", "postgres", "root"]), password()]],
+        ("h", "■ 管理画面"),
+        ("link", rng.choice(ADMIN_PATHS)),  # 本文中のリンクもビーコン。踏まれたら UA がブラウザになる
+        f"ID: {rng.choice(LOGIN_IDS)}　パスワード: {password()}",
+        ("h", "■ VPN"),
+        f"接続先: vpn-gw{rng.randint(1, 3):02d}　事前共有キー: {password()}",
+        "更新: 情報システム部",
+    ]
+
+
+def templates(today):
+    fy = today.year if today.month >= 4 else today.year - 1
+    half = "上期" if 4 <= today.month <= 9 else "下期"
+    return [
+        ("salary", f"{fy}年度_給与一覧.xlsx", lambda: ("xlsx", f"{today.month}月支給", salary())),
+        ("passwords", "パスワード一覧.xlsx", lambda: ("xlsx", "一覧", passwords())),
+        ("evaluation", f"人事評価_{fy}{half}.docx", lambda: ("docx", evaluation(f"{fy}年度{half} 人事評価結果"))),
+        ("servers", "サーバー接続情報.docx", lambda: ("docx", servers())),
+        ("accounts", "振込先口座一覧.xlsx", lambda: ("xlsx", "振込先", accounts())),
+        # 海外の攻撃者は英語のキーワードで選り分けるので、中身は同じで名前だけ英語のものも
+        ("payroll", f"payroll_{fy}.xlsx", lambda: ("xlsx", f"{today.month}月支給", salary())),
+        ("passwords-en", "passwords.xlsx", lambda: ("xlsx", "一覧", passwords())),
+        # サーバーやリポジトリでは docx は開かれず cat されるので、本文の URL を踏ませる
+        ("servers-txt", "接続情報.txt", lambda: ("txt", servers())),
+    ]
+
+
+# --- OOXML ---
+
+NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS_X = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+REL = NS_R + "/"
+CT = "application/vnd.openxmlformats-"
+HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+# 1px の透明画像を外部参照（r:link）で置く。開いたアプリが取りに来る
+BLIP = '<a:blip r:link="rId1"/><a:stretch><a:fillRect/></a:stretch>'
+SPPR = '<a:xfrm><a:off x="0" y="0"/><a:ext cx="9525" cy="9525"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+BOLD = "<w:b/>"
+TITLE = '<w:b/><w:sz w:val="32"/>'
+LINK = '<w:color w:val="0563C1"/><w:u w:val="single"/>'
+TEXT_WIDTH = 8504  # A4 の本文幅（twip）
+
+
+def attr(s):
+    return escape(s, {'"': "&quot;"})
+
+
+def rels(*targets):
+    out = []
+    for i, (typ, target, external) in enumerate(targets, 1):
+        mode = ' TargetMode="External"' if external else ""
+        typ = typ if typ.startswith("http") else REL + typ
+        out.append(f'<Relationship Id="rId{i}" Type="{typ}" Target="{attr(target)}"{mode}/>')
+    return f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{"".join(out)}</Relationships>'
+
+
+def content_types(overrides):
+    parts = [("docProps/core.xml", "package.core-properties+xml"), ("docProps/app.xml", "officedocument.extended-properties+xml"), *overrides]
+    o = "".join(f'<Override PartName="/{p}" ContentType="{CT}{t}"/>' for p, t in parts)
+    return ('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            f'<Default Extension="rels" ContentType="{CT}package.relationships+xml"/>'
+            f'<Default Extension="xml" ContentType="application/xml"/>{o}</Types>')
+
+
+def root_rels(main):
+    return rels(("officeDocument", main, False),
+                ("http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties", "docProps/core.xml", False),
+                ("extended-properties", "docProps/app.xml", False))
+
+
+def xlsx(sheet, rows, beacon):
+    def cell(ref, v, header):
+        if isinstance(v, int):
+            return f'<c r="{ref}" s="2"><v>{v}</v></c>'
+        style = ' s="1"' if header else ""
+        return f'<c r="{ref}" t="inlineStr"{style}><is><t>{escape(v)}</t></is></c>'
+
+    ncol = len(rows[0])
+    data = "".join(f'<row r="{r}">' + "".join(cell(f"{chr(65 + c)}{r}", v, r == 1) for c, v in enumerate(row)) + "</row>"
+                   for r, row in enumerate(rows, 1))
+    cols = "".join(f'<col min="{c + 1}" max="{c + 1}" width="{min(40, max(width(str(r[c])) for r in rows) + 2)}" customWidth="1"/>'
+                   for c in range(ncol))
+    font = '<sz val="11"/><name val="游ゴシック"/><family val="3"/><charset val="128"/>'
+    styles = (f'<styleSheet xmlns="{NS_X}">'
+              f'<fonts count="2"><font>{font}</font><font><b/>{font}</font></fonts>'
+              '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+              '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+              '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+              '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+              '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+              '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+              '<cellStyles count="1"><cellStyle name="標準" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+    drawing = ('<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+               f'xmlns:a="{NS_A}" xmlns:r="{NS_R}"><xdr:oneCellAnchor>'
+               f'<xdr:from><xdr:col>{ncol + 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+               '<xdr:ext cx="9525" cy="9525"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="図 1"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+               f'<xdr:blipFill>{BLIP}</xdr:blipFill><xdr:spPr>{SPPR}</xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>')
+    return {
+        "[Content_Types].xml": content_types([
+            ("xl/workbook.xml", "officedocument.spreadsheetml.sheet.main+xml"),
+            ("xl/worksheets/sheet1.xml", "officedocument.spreadsheetml.worksheet+xml"),
+            ("xl/styles.xml", "officedocument.spreadsheetml.styles+xml"),
+            ("xl/drawings/drawing1.xml", "officedocument.drawing+xml"),
+        ]),
+        "_rels/.rels": root_rels("xl/workbook.xml"),
+        "xl/workbook.xml": f'<workbook xmlns="{NS_X}" xmlns:r="{NS_R}"><sheets><sheet name="{attr(sheet)}" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        "xl/_rels/workbook.xml.rels": rels(("worksheet", "worksheets/sheet1.xml", False), ("styles", "styles.xml", False)),
+        "xl/styles.xml": styles,
+        "xl/worksheets/sheet1.xml": f'<worksheet xmlns="{NS_X}" xmlns:r="{NS_R}"><cols>{cols}</cols><sheetData>{data}</sheetData><drawing r:id="rId1"/></worksheet>',
+        "xl/worksheets/_rels/sheet1.xml.rels": rels(("drawing", "../drawings/drawing1.xml", False)),
+        "xl/drawings/drawing1.xml": drawing,
+        "xl/drawings/_rels/drawing1.xml.rels": rels(("image", beacon + ".gif", True)),
+    }
+
+
+def docx(blocks, beacon):
+    def run(text, props=""):
+        rpr = f"<w:rPr>{props}</w:rPr>" if props else ""
+        return f'<w:r>{rpr}<w:t xml:space="preserve">{escape(text)}</w:t></w:r>'
+
+    def tbl(rows):
+        # 列幅は中身の長さから。はみ出す分は一番広い列で折り返させる
+        need = [max(width(str(r[c])) for r in rows) * 110 + 240 for c in range(len(rows[0]))]
+        widest = need.index(max(need))
+        need[widest] -= max(0, sum(need) - TEXT_WIDTH)
+        border = "".join(f'<w:{s} w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+                         for s in ("top", "left", "bottom", "right", "insideH", "insideV"))
+        grid = "".join(f'<w:gridCol w:w="{w}"/>' for w in need)
+        trs = ""
+        for i, row in enumerate(rows):
+            props = BOLD if i == 0 else ""
+            trs += "<w:tr>" + "".join(f'<w:tc><w:tcPr><w:tcW w:w="{w}" w:type="dxa"/></w:tcPr><w:p>{run(str(v), props)}</w:p></w:tc>'
+                                      for v, w in zip(row, need)) + "</w:tr>"
+        return (f'<w:tbl><w:tblPr><w:tblW w:w="{sum(need)}" w:type="dxa"/><w:tblBorders>{border}</w:tblBorders></w:tblPr>'
+                f"<w:tblGrid>{grid}</w:tblGrid>{trs}</w:tbl>")
+
+    pixel = ('<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="9525" cy="9525"/>'
+             '<wp:docPr id="1" name="図 1"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+             '<pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="図 1"/><pic:cNvPicPr/></pic:nvPicPr>'
+             f"<pic:blipFill>{BLIP}</pic:blipFill><pic:spPr>{SPPR}</pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>")
+    targets = [("image", beacon + ".gif", True), ("styles", "styles.xml", False)]
+    body = ""
+    for b in blocks:
+        if isinstance(b, str):
+            body += f"<w:p>{run(b)}</w:p>"
+        elif isinstance(b, list):
+            body += tbl(b)
+        elif b[0] == "title":
+            body += f'<w:p><w:pPr><w:spacing w:after="240"/></w:pPr>{run(b[1], TITLE)}{pixel}</w:p>'
+        elif b[0] == "h":
+            body += f'<w:p><w:pPr><w:spacing w:before="240"/></w:pPr>{run(b[1], BOLD)}</w:p>'
+        elif b[0] == "link":
+            targets.append(("hyperlink", beacon + b[1], True))
+            body += f'<w:p><w:hyperlink r:id="rId{len(targets)}">{run(beacon + b[1], LINK)}</w:hyperlink></w:p>'
+    ns = (f'xmlns:w="{NS_W}" xmlns:r="{NS_R}" xmlns:a="{NS_A}" '
+          'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+          'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"')
+    sect = ('<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+            '<w:pgMar w:top="1985" w:right="1701" w:bottom="1701" w:left="1701" w:header="851" w:footer="992" w:gutter="0"/></w:sectPr>')
+    styles = (f'<w:styles xmlns:w="{NS_W}"><w:docDefaults><w:rPrDefault><w:rPr>'
+              '<w:rFonts w:ascii="游明朝" w:eastAsia="游明朝" w:hAnsi="游明朝"/><w:sz w:val="21"/>'
+              '<w:lang w:val="en-US" w:eastAsia="ja-JP"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>')
+    return {
+        "[Content_Types].xml": content_types([
+            ("word/document.xml", "officedocument.wordprocessingml.document.main+xml"),
+            ("word/styles.xml", "officedocument.wordprocessingml.styles+xml"),
+        ]),
+        "_rels/.rels": root_rels("word/document.xml"),
+        "word/document.xml": f"<w:document {ns}><w:body>{body}{sect}</w:body></w:document>",
+        "word/styles.xml": styles,
+        "word/_rels/document.xml.rels": rels(*targets),
+    }
+
+
+def fake_times():
+    """それらしい作成日時と更新日時（更新は 1〜2 か月前の業務時間）"""
+    modified = (datetime.now(JST) - timedelta(days=rng.randint(7, 60))).replace(
+        hour=rng.randint(9, 18), minute=rng.randint(0, 59), second=rng.randint(0, 59), microsecond=0)
+    return modified - timedelta(days=rng.randint(30, 300), minutes=rng.randint(0, 600)), modified
+
+
+def txt(blocks, beacon):
+    lines = []
+    for b in blocks:
+        if isinstance(b, str):
+            lines.append(b)
+        elif isinstance(b, list):
+            lines += table([[str(v) for v in row] for row in b])
+        elif b[0] == "title":
+            lines.append(b[1])
+        elif b[0] == "h":
+            lines += ["", b[1]]
+        elif b[0] == "link":
+            lines.append(beacon + b[1])
+    return "\n".join(lines) + "\n"
+
+
+def render(spec, beacon, created, modified):
+    kind = spec[0]
+    if kind == "txt":
+        return txt(spec[1], beacon).encode()
+    parts = xlsx(spec[1], spec[2], beacon) if kind == "xlsx" else docx(spec[1], beacon)
+
+    def utc(d):
+        return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    parts["docProps/core.xml"] = (
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        f"<dc:creator>{rng.choice(SURNAMES)}</dc:creator><cp:lastModifiedBy>{rng.choice(SURNAMES)}</cp:lastModifiedBy>"
+        f'<dcterms:created xsi:type="dcterms:W3CDTF">{utc(created)}</dcterms:created>'
+        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{utc(modified)}</dcterms:modified></cp:coreProperties>')
+    app = "Microsoft Excel" if kind == "xlsx" else "Microsoft Office Word"
+    parts["docProps/app.xml"] = (
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
+        f"<Application>{app}</Application></Properties>")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, xml in parts.items():
+            info = zipfile.ZipInfo(name, modified.timetuple()[:6])
+            info.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(info, HEAD + xml)
+    return buf.getvalue()
+
+
+# --- サブコマンド ---
+
+def cmd_new():
+    base = beacon_base()
+    tpls = templates(date.today())
+    print("埋め込むファイル（番号をスペース区切り）")
+    chosen = [tpls[i] for i in pick([name for _, name, _ in tpls])]
+    exists = [name for _, name, _ in chosen if Path(name).exists()]
+    if exists:
+        sys.exit(f"既にあります: {' '.join(exists)}")
+    memo = ""
+    while not memo:
+        memo = input("メモ: ").strip()
+    for key, name, spec in chosen:
+        token = secrets.token_urlsafe(16)
+        created, modified = fake_times()
+        data = render(spec(), f"{base}t/{token}", created, modified)
+        # 台帳への登録が先。逆だと、登録に失敗したとき鳴らないファイルが残る
+        aws("dynamodb", "put-item", "--table-name", TABLE, "--condition-expression", "attribute_not_exists(id)",
+            "--item", json.dumps({
+                "id": {"S": token}, "template": {"S": key}, "filename": {"S": name}, "description": {"S": memo},
+                "created_at": {"N": str(int(time.time()))}, "hit_count": {"N": "0"},
+            }))
+        Path(name).write_bytes(data)
+        os.utime(name, (modified.timestamp(), modified.timestamp()))
+        print(f"✓ {name}")
+
+
+def cmd_list():
+    rows = [["状態", "作成日", "ファイル", "メモ", "検知", "最終検知"]]
+    for it in items():
+        rows.append([
+            "失効" if "revoked_at" in it else "有効",
+            jst(it["created_at"], "%Y-%m-%d"),
+            it["filename"],
+            it["description"],
+            str(it.get("hit_count", 0)),
+            jst(it["last_hit_at"], "%Y-%m-%d %H:%M") if "last_hit_at" in it else "-",
+        ])
+    print("\n".join(table(rows)))
+
+
+def cmd_revoke():
+    active = [it for it in items() if "revoked_at" not in it]
+    if not active:
+        sys.exit("有効なものはありません")
+    print("失効させるもの（番号をスペース区切り）")
+    chosen = pick(table([[jst(it["created_at"], "%Y-%m-%d"), it["filename"], it["description"]] for it in active]))
+    for i in chosen:
+        aws("dynamodb", "update-item", "--table-name", TABLE, "--key", json.dumps({"id": {"S": active[i]["id"]}}),
+            "--update-expression", "SET revoked_at = :t",
+            "--expression-attribute-values", json.dumps({":t": {"N": str(int(time.time()))}}))
+    print(f"✓ {len(chosen)} 件")
+
+
+def cmd_notify_add():
+    topic = topic_arn()
+    email = ""
+    while "@" not in email:
+        email = input("メール: ").strip()
+    aws("sns", "subscribe", "--topic-arn", topic, "--protocol", "email", "--notification-endpoint", email)
+    # リンクを開かずにここで確認すると、メール末尾の購読解除リンクでは解除できなくなる（AWS の認証が要る）
+    url = input("確認メールのリンク URL（開かずにコピーして貼る）: ").strip()
+    if not url:
+        return print("確認メールのリンクを開いて確認してください")
+    token = parse_qs(urlparse(url).query).get("Token")
+    if not token:
+        sys.exit("URL に Token がありません")
+    aws("sns", "confirm-subscription", "--topic-arn", topic, "--token", token[0], "--authenticate-on-unsubscribe", "true")
+    print(f"✓ {email}")
+
+
+def cmd_notify_remove():
+    subs = [s for s in subscriptions() if s["SubscriptionArn"].startswith("arn:")]  # 未確認のものは解除できない（3 日で消える）
+    if not subs:
+        sys.exit("外せるものはありません")
+    print("外すもの（番号をスペース区切り）")
+    chosen = pick([s["Endpoint"] for s in subs])
+    for i in chosen:
+        aws("sns", "unsubscribe", "--subscription-arn", subs[i]["SubscriptionArn"])
+    print(f"✓ {len(chosen)} 件")
+
+
+def cmd_stack():
+    url = beacon_base()
+    subs = subscriptions()
+    count = aws("dynamodb", "scan", "--table-name", TABLE, "--select", "COUNT")["Count"]
+    rows = [["URL", url], ["トークン", str(count)]]
+    for s in subs:
+        rows.append(["通知先", s["Endpoint"] + ("（未確認）" if s["SubscriptionArn"] == "PendingConfirmation" else "")])
+    if not subs:
+        rows.append(["通知先", "なし（canari notify add）"])
+    print("\n".join(table(rows)))
+
+
+COMMANDS = {
+    "new": cmd_new,
+    "list": cmd_list,
+    "revoke": cmd_revoke,
+    "notify add": cmd_notify_add,
+    "notify remove": cmd_notify_remove,
+    "stack": cmd_stack,
+    "completion": lambda: print(ZSH),
+}
+
+
+def main():
+    cmd = COMMANDS.get(" ".join(sys.argv[1:]))
+    if not cmd:
+        sys.exit(USAGE)
+    try:
+        cmd()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
