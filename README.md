@@ -22,8 +22,8 @@
 ## インストール
 
 ```sh
-git clone git@github.com:kamataryo/tf-canary-securite.git
-cd tf-canary-securite
+git clone git@github.com:kamataryo/canari.git
+cd canari
 aws login
 terraform init
 terraform apply
